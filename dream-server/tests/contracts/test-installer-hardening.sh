@@ -17,6 +17,19 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local file="$1"
+  local pattern="$2"
+  local msg="$3"
+  if grep -qE "$pattern" "$file"; then
+    echo "[FAIL] $msg"
+    echo "---- output ----"
+    cat "$file"
+    echo "----------------"
+    exit 1
+  fi
+}
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -131,5 +144,29 @@ PATH="$open_bin:$PATH" bash -c '
   source installers/lib/detection.sh
   validate_nvidia_blackwell_open_modules
 '
+
+echo "[contract] catalog selector output is parsed without eval"
+assert_contains "lib/safe-env.sh" 'load_model_selector_env_from_output' "safe env loader missing model selector allowlist"
+assert_contains "scripts/select-model.py" 'return f' "model selector no longer emits parser-friendly quoted values"
+if grep -q 'import shlex' scripts/select-model.py; then
+  echo "[FAIL] model selector should not require shell quoting for installer consumption"
+  exit 1
+fi
+for f in installers/phases/02-detection.sh installers/macos/install-macos.sh tests/test-tier-map.sh; do
+  if grep -q 'eval "$_selector_env"' "$f"; then
+    echo "[FAIL] $f still evals model selector output"
+    exit 1
+  fi
+  assert_contains "$f" 'load_model_selector_env_from_output' "$f does not use the allowlisted selector loader"
+done
+
+echo "[contract] compose launch cannot silently produce zero containers"
+assert_contains "installers/phases/11-services.sh" 'logs/compose-launch\.txt' "Linux installer missing compose launch record"
+assert_contains "installers/phases/11-services.sh" 'ps -q' "Linux installer does not count compose-managed containers"
+assert_contains "installers/phases/11-services.sh" 'Docker Compose did not create any managed containers' "Linux installer does not fail loud on zero managed containers"
+assert_not_contains "installers/phases/11-services.sh" '_phase11_assert_managed_containers false' "Linux zero-container path must write a compose failure report"
+assert_contains "installers/macos/install-macos.sh" 'compose-launch\.txt' "macOS installer missing compose launch record"
+assert_contains "installers/macos/install-macos.sh" 'ps -q' "macOS installer does not count compose-managed containers"
+assert_contains "installers/macos/install-macos.sh" 'docker compose up completed but created no managed containers' "macOS installer does not fail loud on zero managed containers"
 
 echo "[PASS] installer hardening contracts"
