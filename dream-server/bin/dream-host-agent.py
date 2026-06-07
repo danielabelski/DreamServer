@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import collections
+import importlib
 import json
 import logging
 import os
@@ -89,6 +90,67 @@ def _to_bash_path(path: Path) -> str:
         drive, tail = match.groups()
         return f"/{drive.lower()}/{tail}"
     return normalized
+
+
+def _python_can_import(python_cmd: str, module: str) -> bool:
+    try:
+        result = subprocess.run(
+            [python_cmd, "-c", f"import {module}"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _process_can_import(module: str) -> bool:
+    """Return whether this already-running host-agent process can import module."""
+    importlib.invalidate_caches()
+    try:
+        importlib.import_module(module)
+    except ImportError:
+        return False
+    return True
+
+
+def _ensure_windows_resolver_pyyaml(python_cmd: str) -> None:
+    """Ensure the Windows host Python and this process can import PyYAML."""
+    if platform.system() != "Windows":
+        return
+    if _python_can_import(python_cmd, "yaml") and _process_can_import("yaml"):
+        return
+
+    logger.warning(
+        "PyYAML is missing from %s; installing it so compose resolution can validate extensions",
+        python_cmd,
+    )
+    pip_cmd = [
+        python_cmd, "-m", "pip", "install",
+        "--user", "--disable-pip-version-check", "--quiet", "PyYAML",
+    ]
+    try:
+        result = subprocess.run(
+            pip_cmd,
+            capture_output=True, text=True, timeout=180, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"failed to install PyYAML for compose resolution: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            "PyYAML is required for compose resolution, but automatic install failed: "
+            f"{detail[:1000]}"
+        )
+
+    if not _python_can_import(python_cmd, "yaml"):
+        raise RuntimeError(
+            "PyYAML install completed but the Windows resolver Python still cannot import yaml"
+        )
+    if not _process_can_import("yaml"):
+        raise RuntimeError(
+            "PyYAML install completed but this host-agent process still cannot import yaml"
+        )
 
 
 def _find_usable_bash() -> str | None:
@@ -268,12 +330,28 @@ def resolve_compose_flags() -> list:
         )
     # --gpu-count gates the multigpu-{backend}.yml overlay; without it,
     # the host agent would resolve a single-GPU stack on multi-GPU hosts.
-    result = subprocess.run(
-        [bash, _to_bash_path(script), "--script-dir", _to_bash_path(INSTALL_DIR),
-         "--tier", TIER, "--gpu-backend", GPU_BACKEND, "--gpu-count", GPU_COUNT],
-        capture_output=True, text=True, check=True,
-        cwd=str(INSTALL_DIR), timeout=30,
-    )
+    env = os.environ.copy()
+    if platform.system() == "Windows":
+        _ensure_windows_resolver_pyyaml(sys.executable)
+        env["DREAM_PYTHON_CMD"] = _to_bash_path(Path(sys.executable))
+    cmd = [
+        bash, _to_bash_path(script),
+        "--script-dir", _to_bash_path(INSTALL_DIR),
+        "--tier", TIER,
+        "--gpu-backend", GPU_BACKEND,
+        "--gpu-count", GPU_COUNT,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True, check=True,
+            cwd=str(INSTALL_DIR), timeout=30, env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(
+            f"compose resolver failed: {detail[:1000]}",
+        ) from exc
     return result.stdout.strip().split()
 
 
@@ -3355,6 +3433,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             # Read current env BEFORE modification — needed for gpu_backend guard
             env_pre = load_env(env_path)
             gpu_backend = env_pre.get("GPU_BACKEND", "nvidia")
+            windows_host_lemonade = _is_windows_host_lemonade(env_pre)
             runtime_profile = _select_runtime_profile(model, env_pre)
             runtime_env = {}
             if runtime_profile:
@@ -3468,8 +3547,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                 hermes_live_exists = hermes_live_config.exists()
             except PermissionError:
                 hermes_live_exists = None
-            hermes_live_patched = _patch_hermes_model_config(hermes_live_config, hermes_model_name)
-            hermes_template_patched = _patch_hermes_model_config(hermes_template_config, hermes_model_name)
+            hermes_base_url = "http://litellm:4000/v1" if windows_host_lemonade else None
+            hermes_live_patched = _patch_hermes_model_config(hermes_live_config, hermes_model_name, base_url=hermes_base_url)
+            hermes_template_patched = _patch_hermes_model_config(hermes_template_config, hermes_model_name, base_url=hermes_base_url)
             # Restart Hermes only when its persisted live config changed, or
             # when no persisted config exists and a patched template can seed
             # the next start. If live config is container-owned and unreadable,
@@ -3493,7 +3573,9 @@ class AgentHandler(BaseHTTPRequestHandler):
             env = load_env(env_path)
             _in_container = bool(os.environ.get("DREAM_HOST_INSTALL_DIR"))
 
-            if gpu_backend == "apple":
+            if windows_host_lemonade:
+                _restart_windows_lemonade(env)
+            elif gpu_backend == "apple":
                 # macOS: manage native llama-server process via PID file
                 pid_file = INSTALL_DIR / "data" / ".llama-server.pid"
                 llama_bin = INSTALL_DIR / "bin" / "llama-server"
@@ -3549,7 +3631,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             # - On the host (native systemd or macOS): use 127.0.0.1 + OLLAMA_PORT.
             #   (Use 127.0.0.1, not localhost — localhost resolves to ::1 on
             #   IPv6-enabled hosts but Docker binds to 127.0.0.1 only.)
-            if os.environ.get("DREAM_HOST_INSTALL_DIR"):
+            if windows_host_lemonade:
+                llama_host = "127.0.0.1"
+                llama_port = env.get("AMD_INFERENCE_PORT", "8080")
+            elif os.environ.get("DREAM_HOST_INSTALL_DIR"):
                 llama_host = "dream-llama-server"
                 llama_port = "8080"
             else:
@@ -3622,7 +3707,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                 logger.warning("Model activation failed — rolling back")
                 restore_backups()
                 rollback_env = load_env(env_path)
-                if gpu_backend == "apple":
+                rollback_windows_host_lemonade = _is_windows_host_lemonade(rollback_env)
+                if rollback_windows_host_lemonade:
+                    _restart_windows_lemonade(rollback_env)
+                elif gpu_backend == "apple":
                     # Stop newly launched native process, re-launch with old params
                     if pid_file.exists():
                         try:
@@ -3763,6 +3851,136 @@ def _send_lemonade_warmup(host: str, port: str, gguf_file: str, attempt: int) ->
     return False
 
 
+def _is_windows_host_lemonade(env: dict) -> bool:
+    runtime = env.get("AMD_INFERENCE_RUNTIME", "").lower()
+    backend = env.get("LLM_BACKEND", "").lower()
+    location = env.get("AMD_INFERENCE_LOCATION", "").lower()
+    return (
+        platform.system().lower() == "windows"
+        and env.get("GPU_BACKEND", "").lower() == "amd"
+        and (runtime == "lemonade" or backend == "lemonade")
+        and location == "host"
+    )
+
+
+def _restart_windows_lemonade(env: dict):
+    """Start managed Windows Lemonade through Task Scheduler.
+
+    Windows OpenSSH can end plain Start-Process children when the SSH logon
+    session exits. Task Scheduler gives the native Lemonade runtime an
+    independent lifecycle, which keeps fleet/dashboard activation stable.
+    """
+    exe = None
+    for root in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if not root:
+            continue
+        candidate = Path(root) / "Lemonade Server" / "bin" / "lemonade-server.exe"
+        if candidate.exists():
+            exe = candidate
+            break
+    if exe is None:
+        raise RuntimeError("lemonade-server.exe not found under Program Files")
+
+    ps_env = os.environ.copy()
+    ps_env.update({
+        "DREAM_WIN_LEMONADE_EXE": str(exe),
+        "DREAM_WIN_MODELS_DIR": str(INSTALL_DIR / "data" / "models"),
+        "DREAM_WIN_PID_FILE": str(INSTALL_DIR / "data" / "llama-server.pid"),
+        "DREAM_WIN_LEMONADE_PORT": env.get("AMD_INFERENCE_PORT", "8080") or "8080",
+        "DREAM_WIN_BIND_ADDR": env.get("BIND_ADDRESS", "127.0.0.1") or "127.0.0.1",
+        "DREAM_WIN_LEMONADE_TASK": "DreamServerLemonadeRuntime",
+    })
+    script = r'''
+$ErrorActionPreference = "Stop"
+$exe = $env:DREAM_WIN_LEMONADE_EXE
+$modelsDir = $env:DREAM_WIN_MODELS_DIR
+$pidPath = $env:DREAM_WIN_PID_FILE
+$port = [int]$env:DREAM_WIN_LEMONADE_PORT
+$bindAddr = $env:DREAM_WIN_BIND_ADDR
+$taskName = $env:DREAM_WIN_LEMONADE_TASK
+
+function Stop-DreamProcessId {
+    param([int]$ProcId)
+    Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    & taskkill.exe /PID $ProcId /T /F | Out-Null
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "Could not stop process $ProcId"
+}
+
+function Get-DreamLemonadeProcesses {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($binDir, [StringComparison]::OrdinalIgnoreCase)) -or
+        ($cacheBin -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($cacheBin, [StringComparison]::OrdinalIgnoreCase)) -or
+        ($_.CommandLine -and $_.CommandLine.IndexOf($modelsDir, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    }
+}
+
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+if (Test-Path $pidPath) {
+    $rawPid = (Get-Content -LiteralPath $pidPath -Raw).Trim()
+    if ($rawPid -match '^\d+$') { Stop-DreamProcessId -ProcId ([int]$rawPid) }
+    Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+}
+foreach ($listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
+    if ($listener.OwningProcess -gt 0) { Stop-DreamProcessId -ProcId ([int]$listener.OwningProcess) }
+}
+$binDir = Split-Path -Parent $exe
+$userProfile = [Environment]::GetFolderPath("UserProfile")
+$cacheBin = if ($userProfile) { Join-Path (Join-Path (Join-Path $userProfile ".cache") "lemonade") "bin" } else { $null }
+foreach ($child in @(Get-DreamLemonadeProcesses)) {
+    Stop-DreamProcessId -ProcId ([int]$child.ProcessId)
+}
+$remaining = @(Get-DreamLemonadeProcesses)
+if ($remaining.Count -gt 0) {
+    $ids = ($remaining | ForEach-Object { "$($_.ProcessId):$($_.Name)" }) -join ", "
+    throw "Could not stop existing Lemonade processes: $ids"
+}
+
+if (-not $existingTask) {
+    $argString = "serve --port $port --host $bindAddr --no-tray --llamacpp vulkan --extra-models-dir `"$modelsDir`""
+    $action = New-ScheduledTaskAction -Execute $exe -Argument $argString -WorkingDirectory (Split-Path -Parent $exe)
+    $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddYears(1))
+    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+}
+Start-ScheduledTask -TaskName $taskName
+$proc = $null
+for ($i = 0; $i -lt 45; $i++) {
+    Start-Sleep -Seconds 1
+    $proc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($exe, [StringComparison]::OrdinalIgnoreCase) } |
+        Sort-Object ProcessId -Descending |
+        Select-Object -First 1
+    if ($proc) { break }
+}
+if (-not $proc) {
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+    $taskResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { "unknown" }
+    throw "Lemonade scheduled task started but no lemonade-server.exe process was found (task result: $taskResult)"
+}
+New-Item -ItemType Directory -Path (Split-Path -Parent $pidPath) -Force | Out-Null
+Set-Content -LiteralPath $pidPath -Value $proc.ProcessId
+'''
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=ps_env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Windows Lemonade restart failed: {(result.stderr or result.stdout).strip()[:500]}")
+    logger.info("Windows Lemonade scheduled task started")
+
+
 def _render_runtime_config(
     install_dir: Path,
     surface: str,
@@ -3863,8 +4081,8 @@ def _write_lemonade_config(install_dir: Path, gguf_file: str):
     logger.info("Wrote lemonade.yaml for model: extra.%s", gguf_file)
 
 
-def _patch_hermes_model_config(path: Path, model_name: str) -> bool:
-    """Patch `model.default` in a Hermes config/template YAML file.
+def _patch_hermes_model_config(path: Path, model_name: str, base_url: str | None = None) -> bool:
+    """Patch `model.default` and optionally `model.base_url` in Hermes config.
 
     Hermes copies the template once into data/hermes/config.yaml and then uses
     the persisted copy as source of truth. Patch both when present so current
@@ -3904,6 +4122,12 @@ def _patch_hermes_model_config(path: Path, model_name: str) -> bool:
         if in_model_block and re.match(r"^\s+default:\s*", line):
             indent = line[:len(line) - len(line.lstrip())]
             new_line = f'{indent}default: "{model_name}"'
+            new_lines.append(new_line)
+            changed = changed or new_line != line
+            continue
+        if base_url and in_model_block and re.match(r"^\s+base_url:\s*", line):
+            indent = line[:len(line) - len(line.lstrip())]
+            new_line = f'{indent}base_url: "{base_url}"'
             new_lines.append(new_line)
             changed = changed or new_line != line
             continue

@@ -23,6 +23,7 @@ _write_lemonade_config = _mod._write_lemonade_config
 _patch_hermes_model_config = _mod._patch_hermes_model_config
 _compose_restart_llama_server = _mod._compose_restart_llama_server
 _launch_native_llama_server = _mod._launch_native_llama_server
+_restart_windows_lemonade = _mod._restart_windows_lemonade
 
 
 # --- _check_lemonade_health ---
@@ -272,6 +273,45 @@ class TestLaunchNativeLlamaServer:
         assert "8192" in cmd
         assert "--reasoning-format" in cmd
         assert "deepseek" in cmd
+
+
+class TestRestartWindowsLemonade:
+
+    def test_reuses_existing_task_and_polls_for_started_process(self, monkeypatch, tmp_path):
+        program_files = tmp_path / "Program Files"
+        lemonade_exe = program_files / "Lemonade Server" / "bin" / "lemonade-server.exe"
+        lemonade_exe.parent.mkdir(parents=True)
+        lemonade_exe.write_text("", encoding="utf-8")
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["script"] = cmd[-1]
+            captured["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setenv("ProgramFiles", str(program_files))
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        _restart_windows_lemonade({
+            "AMD_INFERENCE_PORT": "8080",
+            "BIND_ADDRESS": "0.0.0.0",
+        })
+
+        script = captured["script"]
+        assert "$existingTask = Get-ScheduledTask -TaskName $taskName" in script
+        assert "if (-not $existingTask)" in script
+        assert "Register-ScheduledTask -TaskName $taskName" in script
+        assert "-Force | Out-Null" in script
+        assert "Unregister-ScheduledTask" not in script
+        assert "taskkill.exe /PID $ProcId /T /F" in script
+        assert "for ($i = 0; $i -lt 45; $i++)" in script
+        assert "task result: $taskResult" in script
+        assert "Start-ScheduledTask -TaskName $taskName" in script
+        assert captured["env"]["DREAM_WIN_LEMONADE_TASK"] == "DreamServerLemonadeRuntime"
 
 
 # --- Rollback integration ---

@@ -8,7 +8,7 @@ assert_contains() {
   local file="$1"
   local pattern="$2"
   local msg="$3"
-  if ! grep -qE "$pattern" "$file"; then
+  if ! grep -qE -- "$pattern" "$file"; then
     echo "[FAIL] $msg"
     echo "---- output ----"
     cat "$file"
@@ -21,7 +21,7 @@ assert_not_contains() {
   local file="$1"
   local pattern="$2"
   local msg="$3"
-  if grep -qE "$pattern" "$file"; then
+  if grep -qE -- "$pattern" "$file"; then
     echo "[FAIL] $msg"
     echo "---- output ----"
     cat "$file"
@@ -167,6 +167,64 @@ assert_contains "$macos_installer" '\$pycmd" -m venv "\$venv_dir"' "macOS instal
 assert_not_contains "$macos_installer" 'pip install --user .*pyyaml|pip install .*--user .*pyyaml' "macOS installer still tries user-site PyYAML first"
 assert_contains "$macos_installer" 'export DREAM_PYTHON_CMD' "macOS installer does not export selected Python"
 assert_contains "$macos_installer" '_ds_python_cmd_cached=' "macOS installer does not refresh python resolver cache"
+
+echo "[contract] Windows bootstrap model download uses retry wrapper"
+win_installer="installers/windows/install-windows.ps1"
+assert_contains "$win_installer" 'Invoke-DownloadWithRetry -Url \$tierConfig\.GgufUrl' "Windows installer should retry/resume transient GGUF download failures"
+assert_not_contains "$win_installer" '\$dlOk = Show-ProgressDownload -Url \$tierConfig\.GgufUrl' "Windows installer bootstrap model path should not bypass retry wrapper"
+assert_contains "$win_installer" 'New-ScheduledTaskAction -Execute \$script:LEMONADE_EXE' "Windows installer should launch Lemonade through Task Scheduler"
+assert_contains "$win_installer" 'DreamServerLemonadeRuntime' "Windows installer should use a stable Lemonade scheduled task name"
+assert_contains "$win_installer" 'Invoke-WindowsSttModelDownloadTrigger' "Windows installer should trigger STT preload through a bounded helper"
+assert_contains "$win_installer" '--max-time 30 -X POST' "Windows installer STT preload should use a bounded curl trigger"
+assert_contains "$win_installer" 'Wait-WindowsSttModelCached -ModelUrl' "Windows installer should poll STT cache readiness after triggering download"
+assert_not_contains "$win_installer" 'Invoke-WebRequest -Method POST -Uri "\$whisperUrl/v1/models/\$sttModelEncoded" -TimeoutSec 600' "Windows installer should not block on the long STT preload POST"
+assert_contains "$win_installer" 'nohup bash "\$bashScript"' "Windows installer should detach the full-model upgrade from the installer process tree"
+assert_contains "$win_installer" '< /dev/null &' "Windows installer full-model upgrade should close stdin and background the launcher"
+assert_contains "$win_installer" 'model-upgrade.pid' "Windows installer should record the background model-upgrade PID"
+assert_contains "$win_installer" 'DreamServerModelUpgrade' "Windows installer should launch full-model upgrade through a separate scheduled task"
+python3 - "$win_installer" >"$tmpdir/windows-upgrade-launcher.out" <<'PY'
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index('$upgradeTaskName = "DreamServerModelUpgrade"')
+end = text.index("if (Test-Path -LiteralPath $upgradePidFile)", start)
+block = text[start:end]
+if "Start-Process -FilePath $bashPath" in block or "-Wait" in block:
+    raise SystemExit("model upgrade launcher stays in the installer process tree")
+for needle in (
+    "New-ScheduledTaskAction -Execute $bashPath",
+    "Register-ScheduledTask -TaskName $upgradeTaskName",
+    "Start-ScheduledTask -TaskName $upgradeTaskName",
+):
+    if needle not in block:
+        raise SystemExit(f"model upgrade launcher missing {needle}")
+if "while ($scheduled -and -not (Test-Path -LiteralPath $upgradePidFile)" not in text:
+    raise SystemExit("model upgrade launcher does not poll for PID handoff")
+print("windows-upgrade-launcher-detached")
+PY
+assert_contains "$tmpdir/windows-upgrade-launcher.out" 'windows-upgrade-launcher-detached' "Windows installer should not wait for the full-model launcher wrapper"
+assert_contains "installers/windows/dream.ps1" 'Invoke-DreamSttModelDownloadTrigger' "dream.ps1 repair voice should trigger STT preload through a bounded helper"
+assert_not_contains "installers/windows/dream.ps1" 'Invoke-WebRequest -Method POST -Uri \$voice\.SttModelUrl -TimeoutSec 3600' "dream.ps1 repair voice should not block on the long STT preload POST"
+
+echo "[contract] Windows Lemonade dashboard activation uses native runtime health"
+host_agent="bin/dream-host-agent.py"
+assert_contains "$host_agent" '_is_windows_host_lemonade' "host-agent missing Windows host-backed Lemonade detection"
+assert_contains "$host_agent" '_restart_windows_lemonade\(env\)' "host-agent should restart Windows Lemonade through the native runtime path"
+assert_contains "$host_agent" 'AMD_INFERENCE_PORT' "host-agent should health-check Windows Lemonade on AMD_INFERENCE_PORT"
+assert_contains "$host_agent" 'DreamServerLemonadeRuntime' "host-agent should launch Windows Lemonade through Task Scheduler"
+assert_contains "$host_agent" '\$existingTask = Get-ScheduledTask -TaskName \$taskName' "host-agent should reuse an existing Windows Lemonade task when running with limited privileges"
+
+echo "[contract] Windows Lemonade Hermes uses LiteLLM compact path"
+phase06_win="installers/windows/phases/06-directories.ps1"
+assert_contains "$phase06_win" 'http://litellm:4000/v1' "Windows AMD Hermes should route through LiteLLM, not direct Lemonade"
+assert_contains "$phase06_win" 'local-lemonade' "Windows AMD Hermes should render compact local profile"
+assert_contains "$phase06_win" 'disabled_toolsets:' "Windows AMD Hermes should compact optional toolsets"
+assert_contains "$phase06_win" 'extensions-library-bundle\\services' "Windows installer should consider public-bootstrap extensions-library bundle"
+assert_contains "$phase06_win" 'extensions\\library\\services' "Windows installer should copy product extensions library templates"
+assert_contains "$phase06_win" 'data/extensions-library' "Windows installer should populate data/extensions-library for dashboard extension installs"
+assert_contains "scripts/build-installation-context.py" 'local-lemonade' "SOUL builder should expose local-lemonade profile"
+assert_contains "extensions/services/dashboard-api/routers/models.py" '_loaded_model_backend_ready_sync' "dashboard model no-op should verify live backend readiness"
 
 echo "[contract] Linux phase 06 reports substeps on failure"
 phase06="installers/phases/06-directories.sh"
@@ -341,5 +399,37 @@ assert_contains "installers/macos/install-macos.sh" 'docker compose up completed
 assert_contains "installers/windows/install-windows.ps1" 'Assert-DreamWindowsManagedContainers' "Windows installer does not assert compose-managed containers"
 assert_contains "installers/windows/install-windows.ps1" 'Docker Compose did not create any managed Windows containers' "Windows installer does not fail loud on zero managed containers"
 assert_contains "installers/windows/install-windows.ps1" 'dashboard", "dashboard-api", "open-webui' "Windows installer does not require core container services"
+
+echo "[contract] Windows host agent ignores Store Python aliases and bootstraps real Python"
+assert_contains "installers/windows/phases/07-devtools.ps1" 'Resolve-DreamHostAgentPython' "Windows installer does not resolve a real host-agent Python"
+assert_contains "installers/windows/phases/07-devtools.ps1" 'WindowsApps' "Windows installer does not reject Microsoft Store Python aliases"
+assert_contains "installers/windows/phases/07-devtools.ps1" 'winget install --exact --id Python\.Python\.3\.12' "Windows installer does not bootstrap Python for host-agent"
+assert_contains "installers/windows/phases/07-devtools.ps1" 'PrefixArgs' "Windows installer does not support py launcher -3 arguments"
+assert_contains "installers/windows/phases/07-devtools.ps1" 'Start-ScheduledTask -TaskName \$script:DREAM_AGENT_TASK_NAME' "Windows installer should start host-agent through Scheduled Tasks"
+assert_contains "installers/windows/lib/env-generator.ps1" 'DREAM_AGENT_BIND=.*0\.0\.0\.0' "Windows installer should bind host-agent for dashboard-api container access"
+assert_contains "installers/windows/dream.ps1" 'Resolve-DreamHostAgentPython' "dream.ps1 agent start does not resolve a real Python"
+assert_contains "installers/windows/dream.ps1" 'WindowsApps' "dream.ps1 agent start does not reject Microsoft Store Python aliases"
+assert_contains "installers/windows/dream.ps1" 'PrefixArgs' "dream.ps1 agent start does not support py launcher -3 arguments"
+assert_contains "installers/windows/dream.ps1" 'Register-ScheduledTask -TaskName \$script:DREAM_AGENT_TASK_NAME' "dream.ps1 agent start should use Scheduled Tasks so SSH-launched agents persist"
+assert_contains "installers/windows/dream.ps1" 'RedirectStandardError .* -Wait' "dream.ps1 agent task should wait on Python instead of spawning a transient child"
+assert_contains "lib/python-cmd.sh" 'windowsapps/python3' "Bash Python resolver should reject WindowsApps python3 aliases"
+
+fake_winapps="$tmpdir/Local/Microsoft/WindowsApps"
+fake_realbin="$tmpdir/real-python"
+mkdir -p "$fake_winapps" "$fake_realbin"
+cat >"$fake_winapps/python3" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$fake_realbin/python" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$fake_winapps/python3" "$fake_realbin/python"
+resolver_out="$(PATH="$fake_winapps:$fake_realbin:$PATH" bash -c '. "$1"; ds_detect_python_cmd' bash "$ROOT_DIR/lib/python-cmd.sh")"
+if [[ "$resolver_out" != "python" ]]; then
+  echo "Bash Python resolver selected '$resolver_out' instead of real python after a WindowsApps python3 alias" >&2
+  exit 1
+fi
 
 echo "[PASS] installer hardening contracts"

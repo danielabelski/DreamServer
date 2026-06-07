@@ -267,8 +267,8 @@ if ($dryRun) {
             }
 
             if ($needsDownload) {
-                $dlOk = Show-ProgressDownload -Url $tierConfig.GgufUrl `
-                    -Destination $modelPath -Label "Downloading $($tierConfig.GgufFile)"
+                $dlOk = Invoke-DownloadWithRetry -Url $tierConfig.GgufUrl `
+                    -Destination $modelPath -Label "Downloading $($tierConfig.GgufFile)" -MaxRetries 4
                 if (-not $dlOk) {
                     Write-AIError "Model download failed. Re-run the installer to resume."
                     exit 1
@@ -334,8 +334,8 @@ if ($dryRun) {
                 if (-not (Test-Path $hermesLive)) {
                     Copy-Item -Path $hermesTemplate -Destination $hermesLive -Force
                 }
-                $patchedHermesTemplate = Update-HermesConfigFile -Path $hermesTemplate -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext)
-                $patchedHermesLive = Update-HermesConfigFile -Path $hermesLive -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext)
+                $patchedHermesTemplate = Update-HermesConfigFile -Path $hermesTemplate -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -LemonadeCompact:($gpuInfo.Backend -eq "amd")
+                $patchedHermesLive = Update-HermesConfigFile -Path $hermesLive -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -LemonadeCompact:($gpuInfo.Backend -eq "amd")
                 if (-not ($patchedHermesTemplate -and $patchedHermesLive)) {
                     Write-AIError "Failed to patch Hermes config for Windows runtime (model=$hermesModel, base_url=$hermesBaseUrl)"
                     exit 1
@@ -414,21 +414,32 @@ if ($dryRun) {
                 # Model loads automatically on first chat request -- no /api/v1/load needed
                 Write-AI "Starting Lemonade server..."
                 $modelsDir = Join-Path (Join-Path $installDir "data") "models"
-                $lemonadeArgs = @(
-                    "serve",
-                    "--port", "$($script:LEMONADE_PORT)",
-                    "--host", $bindAddr,
-                    "--no-tray",
-                    "--llamacpp", "vulkan",
-                    "--extra-models-dir", $modelsDir
-                )
-
+                $taskName = "DreamServerLemonadeRuntime"
+                try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch { }
+                try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+                foreach ($listener in @(Get-NetTCPConnection -LocalPort $script:LEMONADE_PORT -State Listen -ErrorAction SilentlyContinue)) {
+                    if ($listener.OwningProcess -gt 0) {
+                        Stop-Process -Id ([int]$listener.OwningProcess) -Force -ErrorAction SilentlyContinue
+                    }
+                }
                 $pidDir = Split-Path $script:INFERENCE_PID_FILE
                 New-Item -ItemType Directory -Path $pidDir -Force | Out-Null
 
-                $proc = Start-Process -FilePath $script:LEMONADE_EXE `
-                    -ArgumentList $lemonadeArgs -WindowStyle Hidden -PassThru
-                Set-Content -Path $script:INFERENCE_PID_FILE -Value $proc.Id
+                $argString = "serve --port $($script:LEMONADE_PORT) --host $bindAddr --no-tray --llamacpp vulkan --extra-models-dir `"$modelsDir`""
+                $action = New-ScheduledTaskAction -Execute $script:LEMONADE_EXE -Argument $argString -WorkingDirectory (Split-Path -Parent $script:LEMONADE_EXE)
+                $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddYears(1))
+                $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+                Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+                Start-ScheduledTask -TaskName $taskName
+                Start-Sleep -Seconds 5
+                $proc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($script:LEMONADE_EXE, [StringComparison]::OrdinalIgnoreCase) } |
+                    Sort-Object ProcessId -Descending |
+                    Select-Object -First 1
+                if (-not $proc) {
+                    throw "Lemonade scheduled task started but no lemonade-server.exe process was found"
+                }
+                Set-Content -Path $script:INFERENCE_PID_FILE -Value $proc.ProcessId
 
                 Write-AI "Waiting for Lemonade server to start..."
                 $maxWait = 60; $waited = 0; $healthy = $false
@@ -443,7 +454,7 @@ if ($dryRun) {
                     if ($waited % 10 -eq 0) { Write-AI "  Still starting... ($waited s)" }
                 }
                 if ($healthy) {
-                    Write-AISuccess "Lemonade server healthy (PID $($proc.Id))"
+                    Write-AISuccess "Lemonade server healthy (PID $($proc.ProcessId))"
                     if ($gpuInfo.HasNpu) {
                         Write-AISuccess "NPU hybrid mode available (NPU prefill + GPU decode)"
                     }
@@ -1072,36 +1083,75 @@ if ($dryRun) {
                 # Convert Windows path to Git Bash Unix-style
                 $bashInstallDir = ($installDir -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
                 $bashScript = ($upgradeScript -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $bashUpgradeLog = ($upgradeLog -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $bashUpgradeErrLog = ($upgradeErrLog -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
+                $upgradePidFile = Join-Path $logDir "model-upgrade.pid"
+                $upgradeLaunchLog = Join-Path $logDir "model-upgrade-launch.log"
+                $upgradeLaunchErrLog = Join-Path $logDir "model-upgrade-launch-err.log"
+                $upgradeTaskName = "DreamServerModelUpgrade"
+                $bashUpgradePidFile = ($upgradePidFile -replace "\\", "/" -replace "^([A-Za-z]):", '/$1').ToLower()
 
                 # Write a temp wrapper script to avoid Windows/PowerShell quoting
                 # issues. Empty arguments (e.g., SHA256 for some tiers) get lost
-                # during command-line parsing -- embedding them in a script file
-                # with bash double-quotes preserves them correctly.
+                # during command-line parsing. The wrapper exits immediately after
+                # nohup detaches the long download, so installer automation is not
+                # held open by the background curl/process handles.
                 $wrapperScript = Join-Path $logDir "bootstrap-run.sh"
                 $wrapperContent = @"
 #!/bin/bash
-exec bash "$bashScript" "$bashInstallDir" "$($fullTierConfig.GgufFile)" "$($fullTierConfig.GgufUrl)" "$($fullTierConfig.GgufSha256)" "$($fullTierConfig.LlmModel)" "$($fullTierConfig.MaxContext)"
+set -uo pipefail
+mkdir -p "`$(dirname "$bashUpgradeLog")"
+nohup bash "$bashScript" "$bashInstallDir" "$($fullTierConfig.GgufFile)" "$($fullTierConfig.GgufUrl)" "$($fullTierConfig.GgufSha256)" "$($fullTierConfig.LlmModel)" "$($fullTierConfig.MaxContext)" > "$bashUpgradeLog" 2> "$bashUpgradeErrLog" < /dev/null &
+pid=`$!
+echo "`$pid" > "$bashUpgradePidFile"
+disown "`$pid" 2>/dev/null || true
 "@
                 [System.IO.File]::WriteAllText($wrapperScript, $wrapperContent.Replace("`r`n", "`n"), (New-Object System.Text.UTF8Encoding($false)))
 
                 $bashPath = Get-UsableWindowsBash -InstallPath $installDir
                 if ($bashPath) {
-                    $upgradeProc = Start-Process -FilePath $bashPath -ArgumentList $wrapperScript `
-                        -WindowStyle Hidden `
-                        -RedirectStandardOutput $upgradeLog `
-                        -RedirectStandardError $upgradeErrLog `
-                        -PassThru
+                    Remove-Item -LiteralPath $upgradePidFile, $upgradeLaunchLog, $upgradeLaunchErrLog -ErrorAction SilentlyContinue
 
-                    Start-Sleep -Seconds 2
-                    $upgradeProc.Refresh()
+                    $scheduled = $false
+                    try {
+                        try { Stop-ScheduledTask -TaskName $upgradeTaskName -ErrorAction SilentlyContinue } catch { }
+                        try { Unregister-ScheduledTask -TaskName $upgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 
-                    if ($upgradeProc.HasExited) {
-                        Write-AIWarn "Background full-model download exited immediately (exit code: $($upgradeProc.ExitCode))."
-                        Write-AI "  Retry manually with: & '$bashPath' '$wrapperScript'"
-                        Write-AI "  Error log: $upgradeErrLog"
-                    } else {
+                        $upgradeAction = New-ScheduledTaskAction -Execute $bashPath -Argument ('"{0}"' -f $wrapperScript)
+                        $upgradeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+                        $upgradePrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+                        Register-ScheduledTask -TaskName $upgradeTaskName `
+                            -Action $upgradeAction `
+                            -Trigger $upgradeTrigger `
+                            -Principal $upgradePrincipal `
+                            -Description "Dream Server background model upgrade" `
+                            -Force | Out-Null
+                        Start-ScheduledTask -TaskName $upgradeTaskName -ErrorAction Stop
+                        $scheduled = $true
+                    } catch {
+                        Write-AIWarn "Background full-model download task failed to start: $($_.Exception.Message)"
+                    }
+
+                    $pidDeadline = (Get-Date).AddSeconds(10)
+                    while ($scheduled -and -not (Test-Path -LiteralPath $upgradePidFile) -and (Get-Date) -lt $pidDeadline) {
+                        Start-Sleep -Milliseconds 250
+                    }
+
+                    if (Test-Path -LiteralPath $upgradePidFile) {
                         Write-AI "Full model ($($fullTierConfig.LlmModel)) downloading in background."
                         Write-AI "Check progress: Get-Content '$upgradeLog' -Tail 10"
+                    } else {
+                        if ($scheduled) {
+                            try {
+                                $taskState = (Get-ScheduledTask -TaskName $upgradeTaskName -ErrorAction Stop).State
+                                Write-AIWarn "Background full-model download task did not write a PID file before continuing (task state: $taskState)."
+                            } catch {
+                                Write-AIWarn "Background full-model download task did not write a PID file before continuing."
+                            }
+                        }
+                        Write-AI "  Retry manually with: & '$bashPath' '$wrapperScript'"
+                        Write-AI "  Launcher log: $upgradeLaunchLog"
+                        Write-AI "  Launcher error log: $upgradeLaunchErrLog"
                     }
                 } else {
                     Write-AIWarn "No Git Bash-compatible shell was found for bootstrap-upgrade.sh."
@@ -1216,6 +1266,7 @@ foreach ($check in $healthChecks) {
 # Prove the file exists AND a minimal completion succeeds before this install may
 # report healthy — otherwise fail loud instead of a "health says yes, chat says no"
 # green install.
+$llmModelReady = $true
 if (-not $cloudMode) {
     Write-AI "Verifying the LLM can actually serve a completion..."
     $llmReady = Test-WindowsLlmModelReadiness -Endpoint $llmEndpoint -InstallDir $installDir `
@@ -1224,6 +1275,7 @@ if (-not $cloudMode) {
         Write-AISuccess "LLM serving verified (model: $($llmReady.ModelId))"
     } else {
         $allHealthy = $false
+        $llmModelReady = $false
         Write-AIError "LLM not serving: $($llmReady.Detail)"
         if (-not $llmReady.FileExists) {
             Write-Host "    Model file missing: $($llmReady.ModelFile)" -ForegroundColor DarkGray
@@ -1236,6 +1288,53 @@ if (-not $cloudMode) {
 # Speaches does NOT auto-download on transcription requests — it returns 404.
 # Trigger the download explicitly, verify it completed, surface recovery
 # instructions on failure. Mirrors Linux Phase 12 and macOS install-macos.sh.
+function Test-WindowsSttModelCached {
+    param([Parameter(Mandatory=$true)][string]$ModelUrl)
+
+    try {
+        $check = Invoke-WebRequest -Uri $ModelUrl -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+        return ($check.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-WindowsSttModelDownloadTrigger {
+    param([Parameter(Mandatory=$true)][string]$ModelUrl)
+
+    # Speaches keeps downloading after the request is accepted. Use a bounded
+    # client so a slow Hugging Face transfer cannot take down the installer host.
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        & $curl.Source --fail --silent --show-error --max-time 30 -X POST $ModelUrl | Out-Null
+        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 28) { return $true }
+        Write-AIWarn "STT model download trigger returned curl exit $LASTEXITCODE; verifying cache before failing."
+        return $false
+    }
+
+    try {
+        Invoke-WebRequest -Method POST -Uri $ModelUrl -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        Write-AIWarn "STT model download trigger failed; verifying cache before failing."
+        return $false
+    }
+}
+
+function Wait-WindowsSttModelCached {
+    param(
+        [Parameter(Mandatory=$true)][string]$ModelUrl,
+        [int]$TimeoutSeconds = 900
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-WindowsSttModelCached -ModelUrl $ModelUrl) { return $true }
+        Start-Sleep -Seconds 5
+    }
+    return (Test-WindowsSttModelCached -ModelUrl $ModelUrl)
+}
+
 $sttModelReady = (-not $enableVoice)
 $sttModelNameForReadiness = ""
 $sttModelCacheUrl = ""
@@ -1271,7 +1370,7 @@ if ($enableVoice) {
     }
     $sttModelEncoded = $sttModel -replace "/", "%2F"
     $whisperUrl = "http://localhost:$whisperPort"
-    $sttRecoveryCmd = "Invoke-WebRequest -Method POST -Uri '$whisperUrl/v1/models/$sttModelEncoded' -TimeoutSec 3600"
+    $sttRecoveryCmd = "curl.exe --max-time 30 -X POST '$whisperUrl/v1/models/$sttModelEncoded'"
     $sttModelNameForReadiness = $sttModel
     $sttModelCacheUrl = "$whisperUrl/v1/models/$sttModelEncoded"
 
@@ -1292,11 +1391,7 @@ if ($enableVoice) {
         Write-Host "    $sttRecoveryCmd" -ForegroundColor DarkGray
     } else {
         # Step 2: skip if already cached.
-        $alreadyCached = $false
-        try {
-            $check = Invoke-WebRequest -Uri "$whisperUrl/v1/models/$sttModelEncoded" -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
-            if ($check.StatusCode -eq 200) { $alreadyCached = $true }
-        } catch { }
+        $alreadyCached = Test-WindowsSttModelCached -ModelUrl $sttModelCacheUrl
 
         if ($alreadyCached) {
             $sttModelReady = $true
@@ -1304,18 +1399,10 @@ if ($enableVoice) {
         } else {
             # Step 3: POST to trigger download.
             Write-AI "Downloading STT model ($sttModel)..."
-            try {
-                Invoke-WebRequest -Method POST -Uri "$whisperUrl/v1/models/$sttModelEncoded" -TimeoutSec 600 -UseBasicParsing -ErrorAction Stop | Out-Null
-            } catch {
-                # Fall through to verification step regardless — POST can succeed or partial-fail.
-            }
+            Invoke-WindowsSttModelDownloadTrigger -ModelUrl $sttModelCacheUrl | Out-Null
 
             # Step 4: verify the model is actually cached.
-            $verified = $false
-            try {
-                $verify = Invoke-WebRequest -Uri "$whisperUrl/v1/models/$sttModelEncoded" -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
-                if ($verify.StatusCode -eq 200) { $verified = $true }
-            } catch { }
+            $verified = Wait-WindowsSttModelCached -ModelUrl $sttModelCacheUrl -TimeoutSeconds 900
 
             if ($verified) {
                 $sttModelReady = $true
@@ -1409,10 +1496,14 @@ if (Test-DreamWindowsServiceEnabled -ServiceId "privacy-shield" -Plan $servicePl
     $privacyPort = Get-ReadinessPort -Name "SHIELD_PORT" -Default "8085"
     $readinessChecks += @{ Name = "Privacy Shield"; Url = "http://localhost:$privacyPort/health"; Container = "dream-privacy-shield"; OpenUrl = "http://localhost:$privacyPort" }
 }
-Write-DreamInstallReadinessSummary -Checks $readinessChecks `
+$installReadiness = Write-DreamInstallReadinessSummary -Checks $readinessChecks `
     -StatusCommand ".\dream.ps1 status" `
     -LogPath (Join-Path $installDir "logs\install.log") `
-    -DashboardUrl "http://localhost:$dashboardPort"
+    -DashboardUrl "http://localhost:$dashboardPort" `
+    -PassThru
+if ($installReadiness -and $installReadiness.AllReady -and $llmModelReady -and $sttModelReady) {
+    $allHealthy = $true
+}
 
 # ── Desktop & Start Menu shortcuts ───────────────────────────────────────────
 try {

@@ -74,6 +74,133 @@ class TestResolveAgentBindAddr:
         assert _resolve_agent_bind_addr({}, "Linux") == "127.0.0.1"
 
 
+class TestResolveComposeFlags:
+
+    def test_windows_passes_host_python_to_bash_resolver(self, tmp_path, monkeypatch):
+        install_dir = tmp_path / "dream-server"
+        scripts_dir = install_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "resolve-compose-stack.sh").write_text("#!/usr/bin/env bash\n")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "TIER", "1")
+        monkeypatch.setattr(_mod, "GPU_BACKEND", "nvidia")
+        monkeypatch.setattr(_mod, "GPU_COUNT", "1")
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(
+            _mod.sys,
+            "executable",
+            r"C:\Users\dreamer\AppData\Local\Programs\Python\Python313\python.exe",
+        )
+        monkeypatch.setenv("DREAM_PYTHON_CMD", "python3")
+        git_bash = r"C:\Program Files\Git\bin\bash.exe"
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: git_bash)
+        monkeypatch.setattr(_mod, "_ensure_windows_resolver_pyyaml", lambda python_cmd: None)
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="-f docker-compose.base.yml\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert resolve_compose_flags() == ["-f", "docker-compose.base.yml"]
+        assert calls
+        assert calls[0][0][0] == git_bash
+        env = calls[0][1]["env"]
+        assert env["DREAM_PYTHON_CMD"] == (
+            "/c/Users/dreamer/AppData/Local/Programs/Python/Python313/python.exe"
+        )
+
+    def test_windows_installs_pyyaml_for_resolver_python(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        python_cmd = r"C:\Users\dreamer\AppData\Local\Programs\Python\Python312\python.exe"
+        calls = []
+        import_attempts = {"count": 0}
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd == [python_cmd, "-c", "import yaml"]:
+                import_attempts["count"] += 1
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0 if import_attempts["count"] > 1 else 1,
+                    "",
+                    "" if import_attempts["count"] > 1 else "ModuleNotFoundError",
+                )
+            if cmd[:4] == [python_cmd, "-m", "pip", "install"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        process_attempts = {"count": 0}
+
+        def fake_process_can_import(module):
+            assert module == "yaml"
+            process_attempts["count"] += 1
+            return True
+
+        monkeypatch.setattr(_mod, "_process_can_import", fake_process_can_import)
+
+        _mod._ensure_windows_resolver_pyyaml(python_cmd)
+
+        assert [python_cmd, "-m", "pip", "install"] == calls[1][:4]
+        assert "--user" in calls[1]
+        assert "PyYAML" in calls[1]
+        assert import_attempts["count"] == 2
+        assert process_attempts["count"] == 1
+
+    def test_windows_pyyaml_check_verifies_running_process_import(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        python_cmd = r"C:\Users\dreamer\AppData\Local\Programs\Python\Python312\python.exe"
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd == [python_cmd, "-c", "import yaml"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:4] == [python_cmd, "-m", "pip", "install"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        process_results = iter([False, True])
+
+        def fake_process_can_import(module):
+            assert module == "yaml"
+            return next(process_results)
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_mod, "_process_can_import", fake_process_can_import)
+
+        _mod._ensure_windows_resolver_pyyaml(python_cmd)
+
+        assert [python_cmd, "-m", "pip", "install"] == calls[1][:4]
+
+    def test_windows_bash_discovery_skips_unusable_path_bash(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(_mod.shutil, "which", lambda name: r"C:\Windows\System32\bash.exe")
+        monkeypatch.setattr(_mod, "_update_usable_bash", None)
+        monkeypatch.setattr(_mod, "_usable_bash", None)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == r"C:\Program Files\Git\bin\bash.exe":
+                return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "WSL has no distro")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _mod._find_update_bash() == r"C:\Program Files\Git\bin\bash.exe"
+        assert calls[0][0] == r"C:\Windows\System32\bash.exe"
+        assert calls[-1][0] == r"C:\Program Files\Git\bin\bash.exe"
+
+
 # --- _split_nmcli_terse — parser for nmcli -t (terse) output ---
 
 
@@ -321,7 +448,7 @@ class TestValidateCoreRecreateIds:
         assert "not eligible" in error.lower()
 
 
-class TestResolveComposeFlags:
+class TestResolveComposeFlagsCache:
 
     def test_prefers_saved_compose_flags_file(self, tmp_path, monkeypatch):
         install_dir = tmp_path / "dream-server"

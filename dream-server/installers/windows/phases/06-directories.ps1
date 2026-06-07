@@ -61,6 +61,7 @@ $_dirs = @(
     (Join-Path $_dataDir "n8n"),
     (Join-Path $_dataDir "qdrant"),
     (Join-Path $_dataDir "models"),
+    (Join-Path $_dataDir "extensions-library"),
     (Join-Path $_dataDir "comfyui"),
     (Join-Path $_dataDir "perplexica"),
     (Join-Path $_dataDir "ape"),
@@ -98,6 +99,30 @@ if ($sourceRoot -ne $installDir) {
     Write-AISuccess "Source files installed to $installDir"
 } else {
     Write-AI "Running in-place (source == install directory) -- skipping file copy"
+}
+
+# Copy extensions library to data dir for dashboard portal installs.
+# Linux/macOS do this in Phase 06 as well; Windows needs the same deployed
+# data/extensions-library tree or dashboard-api refuses /api/extensions/*/install.
+$_extLibDst = Join-Path $_dataDir "extensions-library"
+$_extLibSrc = $null
+$_extLibCandidates = @(
+    (Join-Path $sourceRoot "extensions\library\services"),
+    (Join-Path $installDir "extensions\library\services"),
+    (Join-Path $installDir "extensions-library-bundle\services")
+)
+foreach ($_candidate in $_extLibCandidates) {
+    if (Test-Path -LiteralPath $_candidate) {
+        $_extLibSrc = $_candidate
+        break
+    }
+}
+if ($_extLibSrc) {
+    New-Item -ItemType Directory -Path $_extLibDst -Force | Out-Null
+    Copy-Item -Path (Join-Path $_extLibSrc "*") -Destination $_extLibDst -Recurse -Force
+    Write-AISuccess "Extensions library copied to data/extensions-library (from $_extLibSrc)"
+} else {
+    Write-AIWarn "Extensions library not found; dashboard Extensions page will return 503 until populated"
 }
 
 # ── Copy dream.ps1 CLI + lib/ ─────────────────────────────────────────────────
@@ -228,7 +253,8 @@ function Update-HermesConfigFile {
         [string]$Path,
         [string]$Model,
         [string]$BaseUrl,
-        [int]$ContextLength
+        [int]$ContextLength,
+        [switch]$LemonadeCompact
     )
 
     if (-not (Test-Path $Path)) { return $false }
@@ -271,6 +297,41 @@ function Update-HermesConfigFile {
         }
     }
 
+    if ($LemonadeCompact) {
+        $compactAgent = @"
+agent:
+  disabled_toolsets:
+    - terminal
+    - browser
+    - vision
+    - video
+    - image_gen
+    - video_gen
+    - x_search
+    - moa
+    - tts
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - delegation
+    - cronjob
+    - messaging
+    - homeassistant
+    - spotify
+    - yuanbao
+    - computer_use
+"@
+        if ($content -match '(?ms)^agent:\r?\n.*?(?=^terminal:|^platforms:|^compression:|\z)') {
+            $content = [regex]::Replace($content, '(?ms)^agent:\r?\n.*?(?=^terminal:|^platforms:|^compression:|\z)', "$compactAgent`n")
+        } elseif ($content -match '(?m)^terminal:\s*$') {
+            $content = $content -replace '(?m)^terminal:\s*$', "$compactAgent`nterminal:"
+        } else {
+            $content += "`n$compactAgent`n"
+        }
+    }
+
     [System.IO.File]::WriteAllText($Path, $content, $utf8NoBom)
     $verified = [System.IO.File]::ReadAllText($Path, $utf8NoBom)
     if (-not $verified.Contains("  default: `"$Model`"")) { return $false }
@@ -297,6 +358,14 @@ function Invoke-HermesSoulRefresh {
 
     New-Item -ItemType Directory -Path $_outputDir -Force | Out-Null
     $_rendered = $false
+    $_profileArgs = @()
+    try {
+        $_envText = Get-Content -LiteralPath $_envPath -Raw -ErrorAction Stop
+        if ($_envText -match '(?m)^LLM_BACKEND=lemonade\s*$' -and
+            $_envText -match '(?m)^AMD_INFERENCE_RUNTIME=lemonade\s*$') {
+            $_profileArgs = @("--profile", "local-lemonade")
+        }
+    } catch { }
 
     if (Test-Path $_builder) {
         $_pythonCandidates = @(
@@ -310,7 +379,7 @@ function Invoke-HermesSoulRefresh {
             if (-not $_cmd -or -not $_cmd.Source) { continue }
 
             try {
-                & $_cmd.Source @($_candidate.Args) $_builder "--template" $_template "--env" $_envPath "--output" $_output *>> $script:DS_LOG_FILE
+                & $_cmd.Source @($_candidate.Args) $_builder "--template" $_template "--env" $_envPath "--output" $_output @_profileArgs *>> $script:DS_LOG_FILE
                 if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $_output -PathType Leaf)) {
                     $_rendered = $true
                     break
@@ -373,8 +442,8 @@ if ($enableHermes) {
     if (-not (Test-Path $_hermesLive)) {
         Copy-Item -Path $_hermesTemplate -Destination $_hermesLive -Force
     }
-    $_patchedHermesTemplate = Update-HermesConfigFile -Path $_hermesTemplate -Model $_hermesModel -BaseUrl $_hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext)
-    $_patchedHermesLive = Update-HermesConfigFile -Path $_hermesLive -Model $_hermesModel -BaseUrl $_hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext)
+    $_patchedHermesTemplate = Update-HermesConfigFile -Path $_hermesTemplate -Model $_hermesModel -BaseUrl $_hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -LemonadeCompact:($gpuInfo.Backend -eq "amd")
+    $_patchedHermesLive = Update-HermesConfigFile -Path $_hermesLive -Model $_hermesModel -BaseUrl $_hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -LemonadeCompact:($gpuInfo.Backend -eq "amd")
     if (-not ($_patchedHermesTemplate -and $_patchedHermesLive)) {
         Write-AIError "Failed to patch Hermes config for Windows runtime (model=$_hermesModel, base_url=$_hermesBaseUrl)"
         exit 1
