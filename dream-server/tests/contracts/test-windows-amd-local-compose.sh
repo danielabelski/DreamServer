@@ -21,6 +21,8 @@ grep -q 'host.docker.internal:.*v1' installers/windows/install-windows.ps1 \
   || { echo "[FAIL] Windows llama-server fallback LiteLLM config must route to the host /v1 endpoint"; exit 1; }
 grep -q 'openai/\*' installers/windows/install-windows.ps1 \
   || { echo "[FAIL] Windows llama-server fallback LiteLLM config must preserve wildcard routing"; exit 1; }
+grep -q 'enable_thinking: false' installers/windows/install-windows.ps1 \
+  || { echo "[FAIL] Windows llama-server fallback LiteLLM config must disable Qwen thinking"; exit 1; }
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   echo "[SKIP] docker compose unavailable"

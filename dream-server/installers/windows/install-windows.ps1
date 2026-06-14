@@ -593,12 +593,18 @@ model_list:
       model: openai/$nativeModel
       api_base: $nativeApiBase
       api_key: not-needed
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
 
   - model_name: "*"
     litellm_params:
       model: openai/*
       api_base: $nativeApiBase
       api_key: not-needed
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

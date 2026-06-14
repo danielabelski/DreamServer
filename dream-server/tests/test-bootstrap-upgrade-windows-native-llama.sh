@@ -192,6 +192,8 @@ grep -q 'model: openai/\*' "$install_dir/config/litellm/local.yaml" \
     || fail "LiteLLM local config should preserve wildcard model routing"
 grep -q 'api_base: http://host.docker.internal:8080/v1' "$install_dir/config/litellm/local.yaml" \
     || fail "LiteLLM local config should route to the native Windows llama-server host endpoint"
+grep -q 'enable_thinking: false' "$install_dir/config/litellm/local.yaml" \
+    || fail "LiteLLM local config should disable Qwen thinking for native Windows llama-server"
 ! grep -q 'api_base: http://llama-server:8080/v1' "$install_dir/config/litellm/local.yaml" \
     || fail "LiteLLM local config must not point at the absent llama-server container"
 grep -q 'restart dream-litellm' "$docker_trace" \
