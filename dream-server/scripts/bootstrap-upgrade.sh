@@ -506,7 +506,7 @@ restart_windows_native_llama_server_with_full_model() {
         return 1
     }
 
-    local pid_file llama_exe model_path rollback_model_path log_path bind_addr ctx_size llama_port
+    local pid_file llama_exe model_path rollback_model_path log_path bind_addr ctx_size llama_port reasoning reasoning_fmt
     pid_file="$INSTALL_DIR/data/llama-server.pid"
     llama_exe="$INSTALL_DIR/llama-server/llama-server.exe"
     model_path="$MODELS_DIR/$FULL_GGUF_FILE"
@@ -519,6 +519,13 @@ restart_windows_native_llama_server_with_full_model() {
     [[ -n "$ctx_size" ]] || ctx_size="$FULL_MAX_CONTEXT"
     llama_port="$(read_env_value AMD_INFERENCE_PORT)"
     [[ -n "$llama_port" ]] || llama_port="8080"
+    reasoning="$(read_env_value LLAMA_REASONING)"
+    [[ -n "$reasoning" ]] || reasoning="off"
+    case "$reasoning" in
+        off) reasoning_fmt="none" ;;
+        on)  reasoning_fmt="deepseek" ;;
+        *)   reasoning_fmt="$reasoning" ;;
+    esac
 
     [[ -f "$llama_exe" ]] || {
         log "WARNING: llama-server.exe not found at $llama_exe. Cannot hot-swap native Windows llama-server."
@@ -538,6 +545,7 @@ restart_windows_native_llama_server_with_full_model() {
     DREAM_WIN_BIND_ADDR="$bind_addr" \
     DREAM_WIN_LLAMA_PORT="$llama_port" \
     DREAM_WIN_CTX_SIZE="$ctx_size" \
+    DREAM_WIN_REASONING_FORMAT="$reasoning_fmt" \
     DREAM_WIN_FLASH_ATTN="$(read_env_value LLAMA_ARG_FLASH_ATTN)" \
     DREAM_WIN_CACHE_TYPE_K="$(read_env_value LLAMA_ARG_CACHE_TYPE_K)" \
     DREAM_WIN_CACHE_TYPE_V="$(read_env_value LLAMA_ARG_CACHE_TYPE_V)" \
@@ -591,6 +599,7 @@ restart_windows_native_llama_server_with_full_model() {
                 "--port", $env:DREAM_WIN_LLAMA_PORT,
                 "--n-gpu-layers", "999",
                 "--ctx-size", $env:DREAM_WIN_CTX_SIZE,
+                "--reasoning-format", $env:DREAM_WIN_REASONING_FORMAT,
                 "--metrics"
             )
             if ($env:DREAM_WIN_FLASH_ATTN) { $args += @("--flash-attn", $env:DREAM_WIN_FLASH_ATTN) }

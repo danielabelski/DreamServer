@@ -57,12 +57,14 @@ set -euo pipefail
 : "${DREAM_WIN_ROLLBACK_MODEL_PATH:?}"
 : "${DREAM_WIN_LLAMA_PORT:?}"
 : "${DREAM_WIN_CTX_SIZE:?}"
+: "${DREAM_WIN_REASONING_FORMAT:?}"
 {
   printf 'exe=%s\n' "$DREAM_WIN_LLAMA_EXE"
   printf 'model=%s\n' "$DREAM_WIN_MODEL_PATH"
   printf 'rollback=%s\n' "$DREAM_WIN_ROLLBACK_MODEL_PATH"
   printf 'port=%s\n' "$DREAM_WIN_LLAMA_PORT"
   printf 'ctx=%s\n' "$DREAM_WIN_CTX_SIZE"
+  printf 'reasoning=%s\n' "$DREAM_WIN_REASONING_FORMAT"
 } >> "${DREAM_FAKE_PS_TRACE:?}"
 mkdir -p "$(dirname "$DREAM_WIN_PID_FILE")"
 printf '4242\n' > "$DREAM_WIN_PID_FILE"
@@ -137,6 +139,8 @@ grep -q 'port=8080' "$trace" \
     || fail "PowerShell restart should target the AMD inference port"
 grep -q 'ctx=32768' "$trace" \
     || fail "PowerShell restart should target the full-model context"
+grep -q 'reasoning=none' "$trace" \
+    || fail "PowerShell restart should disable reasoning by default"
 grep -q '^GGUF_FILE=Full.gguf$' "$install_dir/.env" \
     || fail "bootstrap-upgrade should promote GGUF_FILE after verified restart"
 grep -q '^LLM_MODEL=full-model$' "$install_dir/.env" \
