@@ -94,6 +94,7 @@ def test_hermes_whatsapp_bridge_avoids_open_webui_port() -> None:
 
 
 def test_hermes_local_provider_has_generous_timeouts() -> None:
+    base_compose = read(ROOT / "docker-compose.base.yml")
     hermes_compose = read(SERVICES / "hermes" / "compose.yaml")
     hermes_config = read(SERVICES / "hermes" / "cli-config.yaml.template")
 
@@ -109,6 +110,10 @@ def test_hermes_local_provider_has_generous_timeouts() -> None:
     assert_true(
         re.search(r"(?m)^\s+-\s+HERMES_STREAM_STALE_TIMEOUT=900\s*$", hermes_compose) is not None,
         "Hermes streaming paths must allow slow local-model first-token latency",
+    )
+    assert_true(
+        "DREAM_TALK_HERMES_TIMEOUT=${DREAM_TALK_HERMES_TIMEOUT:-900}" in base_compose,
+        "dashboard-api must give Dream Talk the same long local-model timeout on the base stack",
     )
 
 
