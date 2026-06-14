@@ -340,13 +340,14 @@ if ($dryRun) {
                 if (-not (Test-Path $hermesLive)) {
                     Copy-Item -Path $hermesTemplate -Destination $hermesLive -Force
                 }
-                $patchedHermesTemplate = Update-HermesConfigFile -Path $hermesTemplate -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -LemonadeCompact:($gpuInfo.Backend -eq "amd")
-                $patchedHermesLive = Update-HermesConfigFile -Path $hermesLive -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -LemonadeCompact:($gpuInfo.Backend -eq "amd")
+                $hermesRequestTimeout = $(if ($cloudMode) { 180 } else { 900 })
+                $patchedHermesTemplate = Update-HermesConfigFile -Path $hermesTemplate -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -RequestTimeoutSeconds $hermesRequestTimeout -LemonadeCompact:($gpuInfo.Backend -eq "amd")
+                $patchedHermesLive = Update-HermesConfigFile -Path $hermesLive -Model $hermesModel -BaseUrl $hermesBaseUrl -ContextLength ([int]$tierConfig.MaxContext) -RequestTimeoutSeconds $hermesRequestTimeout -LemonadeCompact:($gpuInfo.Backend -eq "amd")
                 if (-not ($patchedHermesTemplate -and $patchedHermesLive)) {
                     Write-AIError "Failed to patch Hermes config for Windows runtime (model=$hermesModel, base_url=$hermesBaseUrl)"
                     exit 1
                 }
-                Write-AISuccess "Patched Hermes config for bootstrap model (model=$hermesModel, context=$($tierConfig.MaxContext))"
+                Write-AISuccess "Patched Hermes config for bootstrap model (model=$hermesModel, context=$($tierConfig.MaxContext), request_timeout=${hermesRequestTimeout}s)"
             }
         }
 

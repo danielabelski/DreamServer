@@ -127,6 +127,9 @@ model:
   provider: "custom"
   base_url: "http://host.docker.internal:8080/v1"
   context_length: 8192
+providers:
+  custom:
+    request_timeout_seconds: 180
 EOF_HERMES
 
 cat > "$install_dir/data/hermes/config.yaml" <<'EOF_HERMES_LIVE'
@@ -135,6 +138,9 @@ model:
   provider: "custom"
   base_url: "http://stale.invalid/v1"
   context_length: 8192
+providers:
+  custom:
+    request_timeout_seconds: 180
 auxiliary:
   compression:
     context_length: 8192
@@ -186,6 +192,8 @@ grep -q '^  context_length: 32768$' "$install_dir/data/hermes/config.yaml" \
     || fail "Hermes live config should use the full-model context"
 grep -q '^    context_length: 32768$' "$install_dir/data/hermes/config.yaml" \
     || fail "Hermes auxiliary compression context should use the full-model context"
+grep -q '^    request_timeout_seconds: 900$' "$install_dir/data/hermes/config.yaml" \
+    || fail "Hermes live config should use the Windows local provider timeout"
 grep -q 'model: openai/Full.gguf' "$install_dir/config/litellm/local.yaml" \
     || fail "LiteLLM local config should route default requests to the bare full-model id"
 grep -q 'model: openai/\*' "$install_dir/config/litellm/local.yaml" \

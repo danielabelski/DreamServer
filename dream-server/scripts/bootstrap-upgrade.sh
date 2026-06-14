@@ -664,7 +664,7 @@ restart_windows_native_llama_server_with_full_model() {
 }
 
 patch_hermes_yaml_with_sed() {
-    local path="$1" model="$2" context_length="$3" base_url="${4:-}"
+    local path="$1" model="$2" context_length="$3" base_url="${4:-}" request_timeout_seconds="${5:-180}"
     [[ -f "$path" ]] || return 1
 
     local model_sed base_url_sed
@@ -676,6 +676,9 @@ patch_hermes_yaml_with_sed() {
         -e "s|^  context_length: .*|  context_length: ${context_length}|"
         -e "s|^    context_length: .*|    context_length: ${context_length}|"
     )
+    if [[ "$request_timeout_seconds" =~ ^[0-9]+$ && "$request_timeout_seconds" != "180" ]]; then
+        sed_args+=(-e "s|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${request_timeout_seconds}|")
+    fi
     if [[ -n "$base_url" ]]; then
         sed_args+=(-e "s|^  base_url: \".*\"[[:space:]]*$|  base_url: \"${base_url_sed}\"|")
     fi
@@ -695,7 +698,7 @@ patch_hermes_yaml_with_sed() {
 }
 
 patch_hermes_model_after_swap() {
-    local runtime llm_backend hermes_base_url old_model new_model tpl live live_host_patch_failed
+    local runtime llm_backend hermes_base_url old_model new_model tpl live live_host_patch_failed hermes_request_timeout
     runtime="$(read_env_value AMD_INFERENCE_RUNTIME | tr '[:upper:]' '[:lower:]')"
     llm_backend="$(read_env_value LLM_BACKEND | tr '[:upper:]' '[:lower:]')"
     hermes_base_url="$(read_env_value HERMES_LLM_BASE_URL)"
@@ -707,10 +710,14 @@ patch_hermes_model_after_swap() {
     fi
 
     log "Patching Hermes config after full-model swap: ${old_model} -> ${new_model}"
+    hermes_request_timeout=180
+    if is_windows_bash; then
+        hermes_request_timeout=900
+    fi
 
     tpl="$INSTALL_DIR/extensions/services/hermes/cli-config.yaml.template"
     if [[ -f "$tpl" ]]; then
-        if ! patch_hermes_yaml_with_sed "$tpl" "$new_model" "$FULL_MAX_CONTEXT" "$hermes_base_url"; then
+        if ! patch_hermes_yaml_with_sed "$tpl" "$new_model" "$FULL_MAX_CONTEXT" "$hermes_base_url" "$hermes_request_timeout"; then
             log "ERROR: Could not patch ${tpl} after full-model swap."
             return 1
         fi
@@ -719,7 +726,7 @@ patch_hermes_model_after_swap() {
     live="$INSTALL_DIR/data/hermes/config.yaml"
     live_host_patch_failed=false
     if [[ -f "$live" ]]; then
-        if ! patch_hermes_yaml_with_sed "$live" "$new_model" "$FULL_MAX_CONTEXT" "$hermes_base_url"; then
+        if ! patch_hermes_yaml_with_sed "$live" "$new_model" "$FULL_MAX_CONTEXT" "$hermes_base_url" "$hermes_request_timeout"; then
             live_host_patch_failed=true
             log "WARNING: Could not patch ${live} after full-model swap; will try the container copy if Hermes is running."
         fi
@@ -732,6 +739,9 @@ patch_hermes_model_after_swap() {
         live_patch="sed -i -e 's|^  default: \".*\"[[:space:]]*$|  default: \"${new_model_sed}\"|' -e 's|^  context_length: .*|  context_length: ${FULL_MAX_CONTEXT}|' -e 's|^    context_length: .*|    context_length: ${FULL_MAX_CONTEXT}|'"
         if [[ -n "$hermes_base_url" ]]; then
             live_patch="${live_patch} -e 's|^  base_url: \".*\"|  base_url: \"${hermes_base_url_sed}\"|'"
+        fi
+        if [[ "$hermes_request_timeout" != "180" ]]; then
+            live_patch="${live_patch} -e 's|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${hermes_request_timeout}|'"
         fi
         live_patch="${live_patch} /opt/data/config.yaml"
         $DOCKER_CMD exec dream-hermes sh -c \
@@ -1575,13 +1585,17 @@ LITELLM_UPGRADE_EOF
             _hermes_new_model="extra.$FULL_GGUF_FILE"
         fi
         log "Patching Hermes config: model.default $_hermes_old_model -> $_hermes_new_model"
+        _hermes_request_timeout=180
+        if is_windows_bash; then
+            _hermes_request_timeout=900
+        fi
 
         # Template on host (user-owned, no sudo needed). Patch this even when
         # Hermes is stopped so future container creates do not copy the stale
         # bootstrap model id.
         _hermes_tpl="$INSTALL_DIR/extensions/services/hermes/cli-config.yaml.template"
         if [[ -f "$_hermes_tpl" ]]; then
-            if ! patch_hermes_yaml_with_sed "$_hermes_tpl" "$_hermes_new_model" "$FULL_MAX_CONTEXT" "$_hermes_base_url"; then
+            if ! patch_hermes_yaml_with_sed "$_hermes_tpl" "$_hermes_new_model" "$FULL_MAX_CONTEXT" "$_hermes_base_url" "$_hermes_request_timeout"; then
                 log "WARNING: Could not patch ${_hermes_tpl} (non-fatal; operator can hand-edit before restarting Hermes)"
             fi
         fi
@@ -1589,7 +1603,7 @@ LITELLM_UPGRADE_EOF
         _hermes_live="$INSTALL_DIR/data/hermes/config.yaml"
         _hermes_live_host_patched=false
         if [[ -f "$_hermes_live" ]]; then
-            if patch_hermes_yaml_with_sed "$_hermes_live" "$_hermes_new_model" "$FULL_MAX_CONTEXT" "$_hermes_base_url"; then
+            if patch_hermes_yaml_with_sed "$_hermes_live" "$_hermes_new_model" "$FULL_MAX_CONTEXT" "$_hermes_base_url" "$_hermes_request_timeout"; then
                 _hermes_live_host_patched=true
             else
                 log "WARNING: Could not patch ${_hermes_live} on host (non-fatal if container patch below succeeds)"
@@ -1603,6 +1617,9 @@ LITELLM_UPGRADE_EOF
             _hermes_live_patch="sed -i -e 's|^  default: \".*\"[[:space:]]*$|  default: \"${_hermes_new_model_sed}\"|' -e 's|^  context_length: .*|  context_length: ${FULL_MAX_CONTEXT}|' -e 's|^    context_length: .*|    context_length: ${FULL_MAX_CONTEXT}|'"
             if [[ -n "$_hermes_base_url" ]]; then
                 _hermes_live_patch="${_hermes_live_patch} -e 's|^  base_url: \".*\"|  base_url: \"${_hermes_base_url_sed}\"|'"
+            fi
+            if [[ "$_hermes_request_timeout" != "180" ]]; then
+                _hermes_live_patch="${_hermes_live_patch} -e 's|^    request_timeout_seconds: 180[[:space:]]*$|    request_timeout_seconds: ${_hermes_request_timeout}|'"
             fi
             _hermes_live_patch="${_hermes_live_patch} -e 's|^  enabled: .*|  enabled: true|' -e 's|^  threshold: .*|  threshold: 0.75|' -e 's|^  target_ratio: .*|  target_ratio: 0.50|' -e 's|^  protect_last_n: .*|  protect_last_n: 40|' /opt/data/config.yaml"
             $DOCKER_CMD exec dream-hermes sh -c \
