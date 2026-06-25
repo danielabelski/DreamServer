@@ -46,6 +46,12 @@ assert_llama_exec_anchored "$bootstrap" "bootstrap hot-swap"
 assert_llama_exec_anchored "$installer" "macOS installer"
 assert_llama_exec_anchored "$cli" "dream-macos restart"
 
+grep -qF 'com.dreamserver.llama-server' "$installer" \
+    || fail "macOS installer must unload legacy llama-server LaunchAgent"
+grep -qF 'com.dreamserver.full-model-download' "$installer" \
+    || fail "macOS installer must unload legacy full-model-download LaunchAgent"
+pass "macOS installer clears legacy native llama LaunchAgents"
+
 grep -qF 'Full model downloaded and verified, but native macOS llama-server did not load it after swap' "$bootstrap" \
     || fail "macOS native hot-swap failure must persist an honest failed status"
 grep -qF 'write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES"' "$bootstrap" \

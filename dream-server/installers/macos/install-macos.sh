@@ -1481,6 +1481,13 @@ else
     # here guarantees a clean slate regardless of what happens below.
     launchctl bootout "gui/$(id -u)/${DREAM_AGENT_PLIST_LABEL}" 2>/dev/null || true
     launchctl bootout "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" 2>/dev/null || true
+    for _legacy_plist_label in \
+        com.dreamserver.llama-server \
+        com.dreamserver.full-model-download; do
+        launchctl bootout "gui/$(id -u)/${_legacy_plist_label}" 2>/dev/null || true
+        rm -f "$HOME/Library/LaunchAgents/${_legacy_plist_label}.plist" 2>/dev/null || true
+    done
+    unset _legacy_plist_label
 
     # ── Start Docker services ──
     chapter "STARTING SERVICES"
