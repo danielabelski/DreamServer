@@ -91,6 +91,19 @@ case "${DOCKER_STUB_MODE:-success}" in
         echo "Container ods-llama-server started"
         exit 0
         ;;
+    fail-startup-twice)
+        state_file="$TMPDIR_TEST/startup-retry-count"
+        count=0
+        [[ -f "$state_file" ]] && count=$(cat "$state_file")
+        count=$((count + 1))
+        echo "$count" > "$state_file"
+        if [[ "$count" -le 2 ]]; then
+            echo "dependency failed to start: Error response from daemon: No such container: stale-compose-id"
+            exit 1
+        fi
+        echo "Container ods-llama-server started"
+        exit 0
+        ;;
     fail-docker-sock)
         echo "unable to get image 'ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.4': permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
         exit 1
@@ -262,6 +275,19 @@ teardown() {
     assert_output --partial "done"
     run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
     assert_output "2"
+}
+
+@test "wrapper: compose up retries repeated transient dependency startup failures" {
+    export DOCKER_STUB_MODE=fail-startup-twice
+    export ODS_COMPOSE_STARTUP_RETRY_ATTEMPTS=3
+    run _compose_run_with_summary "Restarting all services" up -d
+    assert_success
+    assert_output --partial "retrying (1/2)"
+    assert_output --partial "retrying (2/2)"
+    assert_output --partial "Restarting all services"
+    assert_output --partial "done"
+    run grep -c '^DOCKER_ARGS:' "$DOCKER_CALL_LOG"
+    assert_output "3"
 }
 
 @test "wrapper: all args after verb are passed to docker compose" {

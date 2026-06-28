@@ -723,14 +723,22 @@ _compose_run_with_summary() {
         docker compose --progress quiet "$@" >"$_compose_log" 2>&1 || _rc=$?
     fi
 
-    if (( _rc != 0 )) && $_is_compose_up \
-       && grep -Eiq 'dependency failed to start|container .* (exited|is unhealthy)|service .* failed to start|failed to start.*container' "$_compose_log"; then
-        warn "Docker reported a transient service startup failure; waiting briefly and retrying once."
+    local _startup_max_attempts="${ODS_COMPOSE_STARTUP_RETRY_ATTEMPTS:-3}"
+    if ! [[ "$_startup_max_attempts" =~ ^[0-9]+$ ]] || (( _startup_max_attempts < 1 )); then
+        _startup_max_attempts=3
+    fi
+    local _startup_attempt=1
+    local _startup_retries=$(( _startup_max_attempts - 1 ))
+    while (( _rc != 0 )) && $_is_compose_up \
+       && (( _startup_attempt < _startup_max_attempts )) \
+       && grep -Eiq 'dependency failed to start|No such container|container .* (exited|is unhealthy)|service .* failed to start|failed to start.*container' "$_compose_log"; do
+        warn "Docker reported a transient service startup failure; waiting briefly and retrying (${_startup_attempt}/${_startup_retries})."
         sleep "${ODS_COMPOSE_STARTUP_RETRY_DELAY:-15}"
         : >"$_compose_log"
         _rc=0
         docker compose --progress quiet "$@" >"$_compose_log" 2>&1 || _rc=$?
-    fi
+        _startup_attempt=$(( _startup_attempt + 1 ))
+    done
 
     if (( _rc == 0 )); then
         success "${_verb} — done"
